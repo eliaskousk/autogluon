@@ -1352,6 +1352,7 @@ class AutoMMPredictor:
             if self._problem_type != BINARY and per_metric.lower() in [
                 "roc_auc",
                 "average_precision",
+                "f1",
             ]:
                 raise ValueError(f"Metric {per_metric} is only supported for binary classification.")
             pos_label = try_to_infer_pos_label(
@@ -1758,6 +1759,18 @@ class AutoMMPredictor:
         predictor._model = model
         if not resume:
             predictor._continuous_training = True
+
+        mixup_active, _ = get_mixup(
+            model_config=OmegaConf.select(predictor._config, "model"),
+            mixup_config=OmegaConf.select(predictor._config, "data.mixup"),
+            num_classes=predictor._output_shape,
+        )
+        loss_func = get_loss_func(
+            problem_type=predictor._problem_type,
+            mixup_active=mixup_active,
+            loss_func_name=OmegaConf.select(predictor._config, "optimization.loss_function"),
+        )
+        predictor._loss_func = loss_func
 
         return predictor
 
