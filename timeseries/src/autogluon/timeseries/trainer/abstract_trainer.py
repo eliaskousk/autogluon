@@ -6,7 +6,6 @@ from typing import Optional, Tuple, List, Any, Dict, Union, Type
 from warnings import warn
 
 import networkx as nx
-import numpy as np
 import pandas as pd
 
 from autogluon.core.models import AbstractModel
@@ -14,7 +13,7 @@ from autogluon.core.scheduler.scheduler_factory import scheduler_factory
 from autogluon.core.utils.savers import save_pkl, save_json
 from autogluon.core.utils.loaders import load_pkl
 
-from .. import TimeSeriesDataFrame
+from .. import TimeSeriesEvaluator, TimeSeriesDataFrame
 from ..models.abstract import AbstractTimeSeriesModel
 from ..models.gluonts.abstract_gluonts import AbstractGluonTSModel
 from ..utils.metric_utils import check_get_evaluation_metric
@@ -479,63 +478,44 @@ class AbstractTimeSeriesTrainer(SimpleAbstractTrainer):
 
         return model_names_trained
 
-    def _score(self, forecasts, tss, quantile_levels):
-        from gluonts.evaluation import Evaluator
-        from ..utils.warning_filters import evaluator_warning_filter
-        from ..utils.metric_utils import METRIC_COEFFICIENTS
+    def _weight_preds(
+        self,
+        model_preds: Dict[str, TimeSeriesDataFrame],
+        model_names: List[str],
+        weights: List[float]
+    ) -> TimeSeriesDataFrame:
+        # TODO: this is a hack. indices may not match, which should be checked or better,
+        # TODO: weighted accordingly
+        assert len(set(v.shape for v in model_preds.values())) == 1
 
-        eval_metric = self.eval_metric
-
-        evaluator = (
-            Evaluator(quantiles=quantile_levels)
-            if quantile_levels is not None
-            else Evaluator()
+        # TODO: handle NaNs
+        return sum(
+            model_preds[m] * w for m, w in zip(model_names, weights)
         )
 
-        num_series = len(tss)
-        with evaluator_warning_filter():
-            agg_metrics, item_metrics = evaluator(
-                iter(tss), iter(forecasts), num_series=num_series
-            )
-            model_score = agg_metrics[eval_metric] * METRIC_COEFFICIENTS[eval_metric]
-        return model_score
-
-    def _weight_preds(self, model_preds, model_names, weights):
-        from gluonts.model.forecast import SampleForecast
-
-        num_series = len(model_preds[model_names[0]][0])
-        forecasts_ensemble = []
-        for i in range(num_series):
-            samples_weighted_list = []
-            for j, model_name in enumerate(model_names):
-                weight = weights[j]
-                forecasts, _ = model_preds[model_name]
-                forecast = forecasts[i]
-                samples_ensemble = np.multiply(forecast.samples, weight)
-                samples_weighted_list.append(samples_ensemble)
-            samples_ensemble = np.sum(samples_weighted_list, axis=0)
-            forecast_ensemble = SampleForecast(
-                samples=samples_ensemble,
-                start_date=forecast.start_date,
-                freq=forecast.freq,
-                item_id=forecast.item_id
-            )
-            forecasts_ensemble.append(forecast_ensemble)
-        return forecasts_ensemble
-
     def fit_ensemble(self, val_data, model_names):
+        from ..utils.metric_utils import METRIC_COEFFICIENTS
+
         print('fitting ensemble')
+
+        evaluator = TimeSeriesEvaluator(
+            eval_metric=self.eval_metric, prediction_length=self.prediction_length
+        )
+
         model_preds = {}
         for model_name in model_names:
-            model = self.load_model(model_name=model_name)
+            model: AbstractGluonTSModel = self.load_model(model_name=model_name)
             # predict on val_data
-            model_preds[model_name] = model._predict_for_scoring(val_data)
-
-        tss = model_preds[model_names[0]][1]
+            # TODO: make generic, this is gluonts specific
+            forecasts, tss = model._predict_for_scoring(val_data)
+            model_preds[model_name] = model._gluonts_forecasts_to_data_frame(
+                forecasts=forecasts, quantile_levels=self.quantile_levels
+            )
 
         for model_name in model_preds:
-            forecasts, _ = model_preds[model_name]
-            model_score = self._score(forecasts=forecasts, tss=tss, quantile_levels=self.quantile_levels)
+            model_score = evaluator(
+                val_data, model_preds[model_name]
+            ) * METRIC_COEFFICIENTS[self.eval_metric]
             print(f"{model_name}: {model_score}")
 
         weights_list = [[n/100, (100-n)/100] for n in range(101)]
@@ -544,9 +524,10 @@ class AbstractTimeSeriesTrainer(SimpleAbstractTrainer):
         score_out_best = None
 
         for weights in weights_list:
-            forecasts_ensemble = self._weight_preds(model_preds=model_preds, model_names=model_names, weights=weights)
-            # forecast_ensemble
-            model_score = self._score(forecasts=forecasts_ensemble, tss=tss, quantile_levels=self.quantile_levels)
+            forecasts_ensemble = self._weight_preds(
+                model_preds=model_preds, model_names=model_names, weights=weights
+            )
+            model_score = evaluator(val_data, forecasts_ensemble) * METRIC_COEFFICIENTS[self.eval_metric]
             print(f'ENSEMBLE SCORE: {model_score}\tWeights: {weights}')
 
             if score_out_best is None or score_out_best[0] < model_score:
